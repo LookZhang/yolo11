@@ -82,6 +82,7 @@ from ultralytics.utils.torch_utils import (
     model_info,
     scale_img,
     time_sync,
+    torchfx,
 )
 
 try:
@@ -93,6 +94,7 @@ except ImportError:
 class BaseModel(nn.Module):
     """The BaseModel class serves as a base class for all the models in the Ultralytics YOLO family."""
 
+    @torchfx()
     def forward(self, x, *args, **kwargs):
         """
         Perform forward pass of the model for either training or inference.
