@@ -7,11 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Union
 
+import cv2
+
 from ultralytics.utils import (
     ASSETS,
     DEFAULT_CFG,
     DEFAULT_CFG_DICT,
     DEFAULT_CFG_PATH,
+    DEFAULT_SOL_DICT,
     IS_VSCODE,
     LOGGER,
     RANK,
@@ -19,6 +22,7 @@ from ultralytics.utils import (
     RUNS_DIR,
     SETTINGS,
     SETTINGS_FILE,
+    SOLUTIONS_ASSETS,
     TESTS_RUNNING,
     IterableSimpleNamespace,
     __version__,
@@ -29,6 +33,16 @@ from ultralytics.utils import (
     yaml_load,
     yaml_print,
 )
+
+# Define valid solutions
+SOLUTION_MAP = {
+    "count": ("ObjectCounter", "count", "solutions_ci_demo.mp4"),
+    "heatmap": ("Heatmap", "generate_heatmap", "solutions_ci_demo.mp4"),
+    "queue": ("QueueManager", "process_queue", "solutions_ci_demo.mp4"),
+    "speed": ("SpeedEstimator", "estimate_speed", "solutions_ci_demo.mp4"),
+    "workout": ("AIGym", "monitor", "solution_ci_pose_demo.mp4"),
+    "analytics": ("Analytics", "process_data", "solutions_ci_demo.mp4"),
+}
 
 # Define valid tasks and modes
 MODES = {"train", "val", "predict", "export", "track", "benchmark"}
@@ -82,18 +96,24 @@ CLI_HELP_MSG = f"""
     5. Streamlit real-time webcam inference GUI
         yolo streamlit-predict
         
-    6. Run special commands:
+    6. Ultralytics solutions usage
+        yolo solutions count or in {list(SOLUTION_MAP.keys())} source="path/to/video/file.mp4"
+        
+    7. Run special commands:
         yolo help
         yolo checks
         yolo version
         yolo settings
         yolo copy-cfg
         yolo cfg
+        yolo solutions-help
 
     Docs: https://docs.ultralytics.com
+    Solutions: https://docs.ultralytics.com/solutions/
     Community: https://community.ultralytics.com
     GitHub: https://github.com/ultralytics/ultralytics
     """
+SOLUTIONS_CLI_MESSAGE = """"""
 
 # Define keys for arg type checks
 CFG_FLOAT_KEYS = {  # integer or float arguments, i.e. x=2 and x=2.0
@@ -568,6 +588,112 @@ def handle_yolo_settings(args: List[str]) -> None:
         LOGGER.warning(f"WARNING ⚠️ settings error: '{e}'. Please see {url} for help.")
 
 
+def handle_yolo_solutions(args: List[str]) -> None:
+    """
+    Processes YOLO solutions arguments and runs the specified computer vision solutions pipeline.
+
+    Args:
+        args (List[str]): Command-line arguments for configuring and running the Ultralytics YOLO
+            solutions: https://docs.ultralytics.com/solutions/, It can include solution name, source,
+            and other configuration parameters.
+
+    Returns:
+        None: The function processes video frames and saves the output but doesn't return any value.
+
+    Examples:
+        Run people counting solution with default settings:
+        >>> handle_yolo_solutions(["count"])
+
+        Generate heatmaps with custom source:
+        >>> handle_yolo_solutions(
+        ...     [
+        ...         "heatmap",
+        ...         "source=path/to/video/file.mp4",
+        ...     ]
+        ... )
+
+        Run analytics with custom configuration:
+        >>> handle_yolo_solutions(["analytics", "conf=0.25", "source=path/to/video/file.mp4"])
+
+    Notes:
+        - Default configurations are merged from DEFAULT_SOL_DICT and DEFAULT_CFG_DICT
+        - Arguments can be provided in the format 'key=value' or as boolean flags
+        - Available solutions are defined in SOLUTION_MAP with their respective classes and methods
+        - If an invalid solution is provided, defaults to 'count' solution
+        - Output videos are saved in 'runs/solution/{solution_name}' directory
+        - For 'analytics' solution, frame numbers are tracked for generating analytical graphs
+        - Video processing can be interrupted by pressing 'q'
+        - Processes video frames sequentially and saves output in .avi format
+        - If no source is specified, downloads and uses a default sample video
+    """
+    import os  # for directory creation
+
+    from ultralytics import solutions  # import ultralytics solutions
+    from ultralytics.utils.files import increment_path  # for output directory path update
+
+    full_args_dict = {**DEFAULT_SOL_DICT, **DEFAULT_CFG_DICT}  # arguments dictionary
+    overrides = {}
+
+    # check dictionary alignment
+    for arg in merge_equals_args(args):
+        arg = arg.lstrip("-").rstrip(",")
+        if "=" in arg:
+            try:
+                k, v = parse_key_value_pair(arg)
+                overrides[k] = v
+            except (NameError, SyntaxError, ValueError, AssertionError) as e:
+                check_dict_alignment(full_args_dict, {arg: ""}, e)
+        elif arg in full_args_dict and isinstance(full_args_dict.get(arg), bool):
+            overrides[arg] = True
+    check_dict_alignment(full_args_dict, overrides)  # dict alignment
+
+    # Get solution name
+    if args and args[0] in SOLUTION_MAP:  # Check if the first argument is a solution name without key=value format
+        s_n = args.pop(0)  # Extract the solution name directly
+    else:
+        LOGGER.warning(
+            f"⚠️ No valid solution provided. Using default 'count'. Available: {', '.join(SOLUTION_MAP.keys())}"
+        )
+        s_n = "count"  # Default solution if none provided
+
+    cls, method, d_s = SOLUTION_MAP[s_n]  # solution class name, method name and default source
+    solution = getattr(solutions, cls)(**overrides)  # get solution class i.e ObjectCounter
+    process = getattr(solution, method)  # get specific function of class for processing i.e, count from ObjectCounter
+
+    source = overrides.pop("source", None)  # extract source from overrides dict
+    if not source:
+        LOGGER.warning(f"⚠️ WARNING: source not provided. using default source {SOLUTIONS_ASSETS}/{d_s}")
+        from ultralytics.utils.downloads import safe_download
+
+        safe_download(f"{SOLUTIONS_ASSETS}/{d_s}")  # download source from ultralytics assets
+        source = d_s  # set default source
+
+    cap = cv2.VideoCapture(source)  # read the video file
+
+    # extract width, height and fps of the video file, create save directory and initialize video writer
+    w, h, fps = (int(cap.get(x)) for x in (cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT, cv2.CAP_PROP_FPS))
+    if s_n == "analytics":  # analytical graphs follow fixed shape for output i.e w=1920, h=1080
+        w, h = 1920, 1080
+    save_dir = increment_path(Path("runs") / "solutions" / f"{s_n}", exist_ok=False)
+    save_dir.mkdir(parents=True, exist_ok=True)  # create the output directory
+    vw = cv2.VideoWriter(os.path.join(save_dir, "solution.avi"), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+    # Process video frames
+    try:
+        f_n = 0  # frame number, required for analytical graphs
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success:
+                break
+            # increment frame number and pass it for analytics mode, otherwise just process frame
+            frame = process(frame, f_n := f_n + 1) if s_n == "analytics" else process(frame)
+            vw.write(frame)  # write the video frame
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()  # release the video capture
+
+
 def handle_streamlit_inference():
     """
     Open the Ultralytics Live Inference Streamlit app for real-time object detection.
@@ -709,6 +835,8 @@ def entrypoint(debug=""):
         "logout": lambda: handle_yolo_hub(args),
         "copy-cfg": copy_default_cfg,
         "streamlit-predict": lambda: handle_streamlit_inference(),
+        "solutions": lambda: handle_yolo_solutions(args[1:]),
+        "solutions-help": lambda: handle_yolo_solutions(args[1:]),
     }
     full_args_dict = {**DEFAULT_CFG_DICT, **{k: None for k in TASKS}, **{k: None for k in MODES}, **special}
 
